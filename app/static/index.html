@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>硅像素读出板噪声故障定位</title>
+<style>
+:root{--bg:#0f1420;--card:#182032;--line:#2a3650;--fg:#e8edf7;--mut:#8fa0bf;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:26px 24px 10px;max-width:960px;margin:0 auto}
+h1{font-size:21px;margin:0}
+.sub{color:var(--mut);margin:6px 0 0;font-size:13px}
+.lookup{display:flex;gap:8px;margin-top:12px;max-width:420px}
+.lookup input{flex:1}
+main{max-width:960px;margin:0 auto;padding:14px 24px 48px;display:grid;gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+h2{font-size:15px;margin:14px 0 8px}
+h2:first-child{margin-top:0}
+.hint{font-weight:400;color:var(--mut);font-size:12px;margin-left:8px}
+textarea,input[type=text]{width:100%;background:#0d1320;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:8px 10px;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+textarea:focus,input:focus,select:focus{outline:1px solid var(--acc)}
+.check-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.check-label{min-width:36px;color:var(--mut);font-family:ui-monospace,monospace;font-size:13px}
+.check-row input{flex:1}
+select{background:#0d1320;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:8px}
+button{background:#22304a;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--acc)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--acc);border-color:var(--acc);color:#06121f;font-weight:600}
+button.del{padding:8px 10px;color:var(--mut)}
+.actions{display:flex;gap:10px;margin-top:14px}
+#error-panel{margin-top:14px;border:1px solid var(--bad);border-radius:8px;padding:10px 14px;background:rgba(255,107,107,.08);font-size:13px}
+#error-panel{border-color:var(--bad)}
+#error-panel ul{margin:8px 0 0;padding-left:18px}
+#error-panel li{margin:4px 0}
+code{font-family:ui-monospace,Consolas,monospace;background:#0d1320;padding:2px 6px;border-radius:6px}
+.chip{display:inline-block;background:#0d1320;border:1px solid var(--acc);color:var(--acc);border-radius:999px;padding:2px 10px;margin:2px 4px 2px 0;font-family:ui-monospace,monospace;font-size:13px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
+th,td{border-bottom:1px solid var(--line);padding:7px 8px;text-align:left}
+th{color:var(--mut);font-weight:500}
+.hidden{display:none}
+.line{margin:8px 0;font-size:14px;word-break:break-all}
+</style>
+</head>
+<body>
+<header>
+  <h1>硅像素读出板噪声故障定位</h1>
+  <p class="sub">多路奇偶校验告警 · 最小汉明重量故障向量 · 折半综合征索引精确求解</p>
+  <div class="lookup">
+    <input type="text" id="lookup-input" placeholder="按复核编号查询，如 R-xxxxxxxxxx">
+    <button type="button" id="lookup-btn">查询</button>
+  </div>
+</header>
+<main>
+  <section class="card" id="edit-panel">
+    <h2>1. 通道清单<span class="hint">2–36 个唯一通道标识，逗号 / 空格 / 换行分隔</span></h2>
+    <textarea id="channel-input" rows="2" placeholder="例如：1, 2, 3, 4"></textarea>
+    <h2>2. 奇偶校验<span class="hint">1–28 条；每条引用的通道集合非空且互不重复</span></h2>
+    <div id="checks"></div>
+    <button type="button" id="add-check">＋ 添加校验</button>
+    <div class="actions">
+      <button type="button" id="submit" class="primary">提交定位</button>
+      <button type="button" id="reset">清空重填</button>
+    </div>
+    <div id="error-panel" class="hidden"></div>
+  </section>
+
+  <section class="card hidden" id="result-panel">
+    <h2>复核结论</h2>
+    <div class="line" id="review-line"></div>
+    <div class="line" id="status-line"></div>
+    <div class="line" id="fault-line"></div>
+    <div class="line" id="vector-line"></div>
+    <div class="line mut">逐校验复算</div>
+    <table>
+      <thead><tr><th>校验</th><th>引用通道</th><th>观测奇偶</th><th>复算奇偶</th><th>一致</th></tr></thead>
+      <tbody id="checks-tbody"></tbody>
+    </table>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const MAX_CHECKS = 28;
+const DRAFT_KEY = "pfl-draft-v1";
+
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function tokenize(s){return String(s||"").split(/[\s,;，、]+/).map(t=>t.trim()).filter(Boolean);}
+
+function relabel(){
+  [...$("checks").children].forEach((row,i)=>{row.querySelector(".check-label").textContent="P"+(i+1);});
+  $("add-check").disabled = $("checks").children.length >= MAX_CHECKS;
+}
+
+function addCheckRow(channels, parity){
+  if($("checks").children.length >= MAX_CHECKS) return;
+  const row = document.createElement("div");
+  row.className = "check-row";
+  row.innerHTML = '<span class="check-label"></span>'
+    + '<input type="text" class="check-channels" placeholder="通道集合，如 1,2,5">'
+    + '<select class="check-parity" title="观测奇偶值">'
+    + '<option value="0">偶 (0)</option><option value="1">奇 (1)</option></select>'
+    + '<button type="button" class="del" title="删除本校验">✕</button>';
+  row.querySelector(".check-channels").value = channels || "";
+  row.querySelector(".check-parity").value = (parity === "0") ? "0" : "1";
+  row.querySelector(".del").addEventListener("click", ()=>{row.remove(); relabel(); saveDraft();});
+  row.querySelector(".check-channels").addEventListener("input", saveDraft);
+  row.querySelector(".check-parity").addEventListener("change", saveDraft);
+  $("checks").appendChild(row);
+  relabel();
+}
+
+function collectPayload(){
+  return {
+    channels: tokenize($("channel-input").value),
+    checks: [...$("checks").children].map(row=>({
+      channels: tokenize(row.querySelector(".check-channels").value),
+      parity: row.querySelector(".check-parity").value
+    }))
+  };
+}
+
+function clearErrors(){$("error-panel").classList.add("hidden"); $("error-panel").innerHTML="";}
+function showErrors(list){
+  const items = list.map(e=>'<li><code>'+esc((e.loc||[]).join(".")||"body")+'</code>：'+esc(e.msg||String(e))+'</li>').join("");
+  $("error-panel").innerHTML = "<b>提交被拒绝（当前编辑内容已保留）：</b><ul>"+items+"</ul>";
+  $("error-panel").classList.remove("hidden");
+}
+
+// 清除旧证据：隐藏旧结论、清空结果区，并摘掉地址栏中的旧复核编号，
+// 防止刷新后把旧结论误作当前输入的全板结论。
+function clearEvidence(){
+  $("result-panel").classList.add("hidden");
+  $("review-line").innerHTML=""; $("status-line").innerHTML="";
+  $("fault-line").innerHTML=""; $("vector-line").innerHTML="";
+  $("checks-tbody").innerHTML="";
+  if(new URLSearchParams(location.search).get("id")){
+    history.replaceState(null,"",location.pathname);
+  }
+}
+
+function renderResult(rec){
+  const r = rec.result || {};
+  $("result-panel").classList.remove("hidden");
+  $("review-line").innerHTML = '复核编号：<code>'+esc(rec.review_id)+'</code> <span class="mut">'+esc(rec.created_at||"")+'</span>';
+  if(r.status === "optimal"){
+    $("status-line").innerHTML = '状态：<b class="ok">可行 · 全板最优结论</b>（最小故障数 <b>'+r.weight+'</b>）';
+    $("fault-line").innerHTML = '故障通道：' + ((r.fault_channels||[]).map(c=>'<span class="chip">'+esc(c)+'</span>').join("") || '<span class="mut">（无）</span>');
+    $("vector-line").innerHTML = '选择向量（通道升序 '+(r.ordered_channels||[]).map(esc).join(" ")+'）：<code>'+esc(r.selection_vector||"")+'</code>';
+  }else{
+    $("status-line").innerHTML = '状态：<b class="bad">不可行</b> —— 不存在同时满足全部校验的故障向量，已保存不可行结论（不返回近似集合）';
+    $("fault-line").innerHTML = '故障通道：<span class="mut">—</span>';
+    $("vector-line").innerHTML = "";
+  }
+  $("checks-tbody").innerHTML = (r.checks||[]).map(c=>{
+    const re = (c.recomputed===null||c.recomputed===undefined) ? "—" : c.recomputed;
+    const ok = (c.ok===null||c.ok===undefined) ? "—" : (c.ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>');
+    return '<tr><td>P'+(c.index+1)+'</td><td>'+(c.channels||[]).map(esc).join(", ")+'</td><td>'+c.observed+'</td><td>'+re+'</td><td>'+ok+'</td></tr>';
+  }).join("");
+  $("result-panel").scrollIntoView({behavior:"smooth",block:"nearest"});
+}
+
+async function submit(){
+  clearErrors();
+  let resp, data;
+  try{
+    resp = await fetch("/api/reviews",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(collectPayload())});
+    data = await resp.json();
+  }catch(e){
+    clearEvidence();
+    showErrors([{loc:["network"],msg:"无法连接服务，请稍后重试"}]);
+    return;
+  }
+  if(resp.ok){
+    localStorage.removeItem(DRAFT_KEY);
+    renderResult(data);
+    history.replaceState(null,"","?id="+encodeURIComponent(data.review_id));
+  }else{
+    // 输入非法 / 重复通道等：保留编辑内容，仅清除旧证据
+    clearEvidence();
+    const detail = Array.isArray(data && data.detail) ? data.detail : [{loc:["server"],msg:(data && data.detail) || "未知错误"}];
+    showErrors(detail);
+  }
+}
+
+function fillForm(input){
+  $("channel-input").value = (input.channels||[]).join(", ");
+  $("checks").innerHTML = "";
+  (input.checks||[]).forEach(c=>addCheckRow((c.channels||[]).join(", "), String(c.parity)));
+  relabel();
+}
+
+async function loadReview(id){
+  clearErrors();
+  let resp, data;
+  try{ resp = await fetch("/api/reviews/"+encodeURIComponent(id)); data = await resp.json(); }
+  catch(e){ showErrors([{loc:["network"],msg:"无法连接服务"}]); return; }
+  if(resp.status === 404){ showErrors([{loc:["review_id"],msg:"复核编号 "+id+" 不存在或已清除"}]); return; }
+  if(!resp.ok){ showErrors([{loc:["server"],msg:"加载失败"}]); return; }
+  fillForm(data.input||{});
+  renderResult(data);
+}
+
+let draftTimer = null;
+function saveDraft(){
+  if(new URLSearchParams(location.search).get("id")) return;
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(()=>{
+    try{ localStorage.setItem(DRAFT_KEY, JSON.stringify(collectPayload())); }catch(e){}
+  },300);
+}
+function restoreDraft(){
+  try{
+    const raw = localStorage.getItem(DRAFT_KEY);
+    if(!raw) return false;
+    fillForm(JSON.parse(raw));
+    return true;
+  }catch(e){ return false; }
+}
+
+document.addEventListener("DOMContentLoaded", ()=>{
+  $("add-check").addEventListener("click", ()=>{addCheckRow(); saveDraft();});
+  $("submit").addEventListener("click", submit);
+  $("reset").addEventListener("click", ()=>{
+    $("channel-input").value=""; $("checks").innerHTML="";
+    addCheckRow(); addCheckRow(); addCheckRow();
+    clearErrors(); clearEvidence(); localStorage.removeItem(DRAFT_KEY);
+  });
+  $("channel-input").addEventListener("input", saveDraft);
+  $("lookup-btn").addEventListener("click", ()=>{
+    const id = $("lookup-input").value.trim();
+    if(id) location.search = "?id="+encodeURIComponent(id);
+  });
+  const id = new URLSearchParams(location.search).get("id");
+  if(id){ loadReview(id); }
+  else if(!restoreDraft()){ addCheckRow(); addCheckRow(); addCheckRow(); }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    image: parity-fault-localizer:latest
+    environment:
+      PORT: "${PORT:-8000}"          # 容器内监听端口，可改
+      DATA_DIR: /data
+    volumes:
+      - parity_data:/data            # 复核记录持久化
+    ports:
+      - "${APP_PORT:-8080}:${PORT:-8000}"   # 宿主机端口，可改（默认 8080）
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/healthz',timeout=2)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    image: parity-fault-localizer:latest
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      API_BASE: "http://app:${PORT:-8000}"
+    command: ["python", "-m", "verify.run"]
+    # 运行代码测试、构建检查与 API 冒烟后退出，退出码即验证结果
+
+volumes:
+  parity_data:
